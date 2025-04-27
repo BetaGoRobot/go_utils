@@ -28,6 +28,7 @@ type importLine struct {
 }
 
 type warmupTemplateData struct {
+	PackageName string
 	Imports     []importLine
 	WarmupCalls []warmupCall
 }
@@ -35,6 +36,13 @@ type warmupTemplateData struct {
 type rawCall struct {
 	Expr    string
 	Comment string
+}
+
+type packageData struct {
+	PackageName string
+	Dir         string
+	RawCalls    []rawCall
+	ImportPaths map[string]string
 }
 
 func main() {
@@ -45,90 +53,105 @@ func main() {
 }
 
 func generate(dir *string) {
-	rawCalls, importPaths, _ := scanGoFiles(*dir)
-	imports := buildImportLines(importPaths, *dir)
-	uniqueCalls := deduplicateCalls(rawCalls)
-	generateWarmupCode(*dir, imports, uniqueCalls)
-}
+	pkgs := scanPackages(*dir)
+	modulePrefix := getGoModModuleName(*dir)
 
-func scanGoFiles(dir string) ([]rawCall, map[string]string, map[string]string) {
-	var rawCalls []rawCall
-	importPaths := map[string]string{}
-	importMap := map[string]string{}
-
-	_ = filepath.Walk(dir, func(path string, _ os.FileInfo, err error) error {
-		if err != nil || filepath.Ext(path) != ".go" || filepath.Base(path) == "warmup_gen.go" {
-			return nil
-		}
-		fileCalls, pkgImport, fileImportMap := analyzeFile(path, dir)
-		rawCalls = append(rawCalls, fileCalls...)
-		for k, v := range pkgImport {
-			importPaths[k] = v
-		}
-		for k, v := range fileImportMap {
-			importMap[k] = v
-		}
-		return nil
-	})
-	return rawCalls, importPaths, importMap
-}
-
-func analyzeFile(path, baseDir string) ([]rawCall, map[string]string, map[string]string) {
-	var results []rawCall
-	importPaths := map[string]string{}
-	importMap := map[string]string{}
-
-	fs := token.NewFileSet()
-	node, err := parser.ParseFile(fs, path, nil, parser.AllErrors)
-	if err != nil || node.Name.Name == "main" {
-		return nil, importPaths, importMap
-	}
-
-	pkgName := node.Name.Name
-	relImportPath, _ := filepath.Rel(baseDir, filepath.Dir(path))
-	importPaths[pkgName] = relImportPath
-
-	for _, imp := range node.Imports {
-		importPath := strings.Trim(imp.Path.Value, "\"")
-		if imp.Name != nil {
-			importMap[imp.Name.Name] = importPath
-		} else {
-			segments := strings.Split(importPath, "/")
-			importMap[segments[len(segments)-1]] = importPath
-		}
-	}
-
-	for _, decl := range node.Decls {
-		funcDecl, ok := decl.(*ast.FuncDecl)
-		if !ok || funcDecl.Body == nil {
+	for _, pkg := range pkgs {
+		if len(pkg.RawCalls) == 0 {
 			continue
 		}
-
-		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
-			callExpr, ok := n.(*ast.CallExpr)
-			if !ok || !containsGetCurrentFunc(callExpr.Fun, importMap) {
-				return true
-			}
-
-			funcPos := fs.Position(funcDecl.Pos())
-			callPos := fs.Position(callExpr.Lparen)
-
-			fullCall := buildFunctionCall(pkgName, funcDecl)
-			relPath, _ := filepath.Rel(baseDir, funcPos.Filename)
-			comment := fmt.Sprintf("%s:%d", relPath, callPos.Line)
-			log.Printf("Found function: %s in file %s", fullCall, comment)
-			log.Printf("  ↳ calls reflecting.GetCurrentFunc() at %s:%d", relPath, callPos.Line)
-			results = append(results, rawCall{Expr: fullCall, Comment: comment})
-			return true
-		})
+		imports := buildImportLines(pkg.ImportPaths, modulePrefix)
+		uniqueCalls := deduplicateCalls(pkg.RawCalls)
+		generateWarmupCode(pkg, imports, uniqueCalls)
 	}
-	return results, importPaths, importMap
 }
 
-func buildFunctionCall(pkgName string, funcDecl *ast.FuncDecl) string {
-	if funcDecl.Recv == nil {
-		return fmt.Sprintf("%s.%s", pkgName, funcDecl.Name.Name)
+func scanPackages(dir string) []packageData {
+	pkgMap := map[string]*packageData{}
+
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || filepath.Ext(path) != ".go" || filepath.Base(path) == "warmup.gen.go" {
+			return nil
+		}
+
+		fs := token.NewFileSet()
+		node, err := parser.ParseFile(fs, path, nil, parser.AllErrors)
+		if err != nil || node.Name.Name == "main" {
+			return nil
+		}
+
+		pkgDir := filepath.Dir(path)
+		pkgName := node.Name.Name
+
+		pkg, ok := pkgMap[pkgDir]
+		if !ok {
+			pkg = &packageData{
+				PackageName: pkgName,
+				Dir:         pkgDir,
+				ImportPaths: make(map[string]string),
+			}
+			pkgMap[pkgDir] = pkg
+		}
+
+		relImportPath, _ := filepath.Rel(dir, pkgDir)
+		pkg.ImportPaths[pkgName] = relImportPath
+
+		importMap := map[string]string{}
+		for _, imp := range node.Imports {
+			importPath := strings.Trim(imp.Path.Value, "\"")
+			if imp.Name != nil {
+				importMap[imp.Name.Name] = importPath
+			} else {
+				segments := strings.Split(importPath, "/")
+				importMap[segments[len(segments)-1]] = importPath
+			}
+		}
+
+		for _, decl := range node.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || funcDecl.Body == nil {
+				continue
+			}
+
+			// Skip generic functions
+			if funcDecl.Type.TypeParams != nil {
+				continue
+			}
+
+			ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+				callExpr, ok := n.(*ast.CallExpr)
+				if !ok || !containsGetCurrentFunc(callExpr.Fun, importMap) {
+					return true
+				}
+
+				funcPos := fs.Position(funcDecl.Pos())
+				callPos := fs.Position(callExpr.Lparen)
+
+				fullCall := buildFunctionCall(pkgName, funcDecl)
+				relPath, _ := filepath.Rel(dir, funcPos.Filename)
+				comment := fmt.Sprintf("%s:%d", relPath, callPos.Line)
+
+				log.Printf("Found function: %s in file %s", fullCall, comment)
+				pkg.RawCalls = append(pkg.RawCalls, rawCall{Expr: fullCall, Comment: comment})
+				return true
+			})
+		}
+
+		return nil
+	})
+
+	var result []packageData
+	for _, pkg := range pkgMap {
+		result = append(result, *pkg)
 	}
+	return result
+}
+
+func buildFunctionCall(currentPkg string, funcDecl *ast.FuncDecl) string {
+	if funcDecl.Recv == nil {
+		return funcDecl.Name.Name
+	}
+
 	var structName string
 	var isPointer bool
 	switch recvType := funcDecl.Recv.List[0].Type.(type) {
@@ -141,13 +164,12 @@ func buildFunctionCall(pkgName string, funcDecl *ast.FuncDecl) string {
 		}
 	}
 	if isPointer {
-		return fmt.Sprintf("(*%s.%s).%s", pkgName, structName, funcDecl.Name.Name)
+		return fmt.Sprintf("(*%s).%s", structName, funcDecl.Name.Name)
 	}
-	return fmt.Sprintf("%s.%s.%s", pkgName, structName, funcDecl.Name.Name)
+	return fmt.Sprintf("%s.%s", structName, funcDecl.Name.Name)
 }
 
-func buildImportLines(importPaths map[string]string, baseDir string) []importLine {
-	modulePrefix := getGoModModuleName(baseDir)
+func buildImportLines(importPaths map[string]string, modulePrefix string) []importLine {
 	var imports []importLine
 	for alias, path := range importPaths {
 		imports = append(imports, importLine{
@@ -170,36 +192,27 @@ func deduplicateCalls(rawCalls []rawCall) []warmupCall {
 	return result
 }
 
-func generateWarmupCode(dir string, imports []importLine, calls []warmupCall) {
-	// sort warmcalls & importLine
-	slices.SortFunc(
-		imports,
-		func(a, b importLine) int {
-			if a.Path < b.Path {
-				return -1
-			} else if a.Path == b.Path {
-				return 0
-			}
-			return 1
-		},
-	)
-	slices.SortFunc(
-		calls,
-		func(a, b warmupCall) int {
-			if a.Expr < b.Expr {
-				return -1
-			} else if a.Expr == b.Expr {
-				return 0
-			}
-			return 1
-		},
-	)
+func generateWarmupCode(pkg packageData, imports []importLine, calls []warmupCall) {
+	slices.SortFunc(imports, func(a, b importLine) int {
+		return strings.Compare(a.Path, b.Path)
+	})
+	slices.SortFunc(calls, func(a, b warmupCall) int {
+		return strings.Compare(a.Expr, b.Expr)
+	})
+	if len(calls) == 0 {
+		return
+	}
 	tpl := template.Must(template.New("warmup").Funcs(template.FuncMap{
 		"join": strings.Join,
 	}).Parse(warmupTemplateText))
 
 	var buf bytes.Buffer
-	tplData := warmupTemplateData{Imports: imports, WarmupCalls: calls}
+	tplData := warmupTemplateData{
+		PackageName: pkg.PackageName,
+		Imports:     imports,
+		WarmupCalls: calls,
+	}
+
 	if err := tpl.Execute(&buf, tplData); err != nil {
 		log.Fatalf("template execution failed: %v", err)
 	}
@@ -209,7 +222,7 @@ func generateWarmupCode(dir string, imports []importLine, calls []warmupCall) {
 		log.Fatalf("failed to format code: %v", err)
 	}
 
-	outputFile := filepath.Join(dir, "warmup.gen.go")
+	outputFile := filepath.Join(pkg.Dir, "warmup.gen.go")
 	if err := os.WriteFile(outputFile, formattedCode, 0644); err != nil {
 		log.Fatalf("failed to write file: %v", err)
 	}
